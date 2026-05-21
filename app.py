@@ -152,10 +152,6 @@ def extract_slik_data_from_bytes(pdf_bytes, pdf_name):
 # 2️⃣  FUNGSI EKSTRAKSI MUTASI REKENING
 # =========================================================
 def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
-    """
-    Mengekstrak rekap mutasi rekening BRI (BRISIM) dari PDF.
-    Mengembalikan dict satu baris rekap per file, atau None jika gagal.
-    """
     reader = PdfReader(BytesIO(pdf_bytes))
     text = ""
     for page in reader.pages:
@@ -169,7 +165,7 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
     if nm:
         nama = nm.group(1).strip()
 
-    # --- Periode transaksi  (DD/MM/YY - DD/MM/YY) ---
+    # --- Periode transaksi ---
     bulan_str = "(Tidak ditemukan)"
     tahun_str = "(Tidak ditemukan)"
     pm = re.search(
@@ -177,24 +173,19 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         text
     )
     if pm:
-        # Ambil bulan & tahun dari tanggal MULAI periode
-        start = pm.group(1)           # DD/MM/YY
+        start = pm.group(1)
         parts = start.split('/')
         bulan_str = BULAN_MAP.get(parts[1], parts[1])
         tahun_str = '20' + parts[2]
 
-    # --- Saldo Awal, Total Debet, Total Kredit, Saldo Akhir ---
+    # --- Saldo & transaksi ---
     def parse_rp(s):
-        """Konversi string '151,847.00' ke float."""
         try:
             return float(s.replace(',', ''))
         except Exception:
             return 0.0
 
-    saldo_awal     = 0.0
-    total_debet    = 0.0
-    total_kredit   = 0.0
-    saldo_akhir    = 0.0
+    saldo_awal = total_debet = total_kredit = saldo_akhir = 0.0
 
     sm = re.search(
         r'Saldo Awal\nOpening Balance\nTotal Transaksi Debet\nTotal Debit Transaction\n'
@@ -209,7 +200,6 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         saldo_akhir  = parse_rp(sm.group(4))
 
     def fmt_rp(v):
-        """Format float ke string Rupiah: 151,847.00"""
         return f"{v:,.2f}"
 
     return {
@@ -220,22 +210,25 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         "Total Transaksi Debet (Total Debit Transaction)": fmt_rp(total_debet),
         "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp(total_kredit),
         "Saldo Akhir (Closing Balance)": fmt_rp(saldo_akhir),
-        # Nilai numerik untuk perhitungan baris total
-        "_saldo_awal_num":    saldo_awal,
-        "_total_debet_num":   total_debet,
-        "_total_kredit_num":  total_kredit,
-        "_saldo_akhir_num":   saldo_akhir,
+        "_saldo_awal_num": saldo_awal,
+        "_total_debet_num": total_debet,
+        "_total_kredit_num": total_kredit,
+        "_saldo_akhir_num": saldo_akhir,
         "Nama File PDF": pdf_name,
     }
 
 
 # =========================================================
-# 3️⃣  FUNGSI HISTORY SLIK (tidak berubah)
+# 3️⃣  FUNGSI FILTER SLIK → KEMBALIKAN BYTESIO (BUKAN SAVE KE FOLDER)
 # =========================================================
-def process_history_with_filter(df, filename, folder="history"):
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-
+def build_filtered_slik_excel(df: pd.DataFrame, filename: str) -> tuple[BytesIO, str]:
+    """
+    Membuat file Excel dengan filter:
+    - Jenis Penggunaan mengandung 'Modal Kerja'
+    - Kondisi mengandung 'Fasilitas'
+    
+    Mengembalikan tuple: (BytesIO excel, pesan status)
+    """
     df_processed = df.copy()
     for col in ['Jenis Penggunaan', 'Kondisi', 'Nama Sesuai Identitas']:
         df_processed[col] = df_processed[col].astype(str).str.strip()
@@ -275,26 +268,23 @@ def process_history_with_filter(df, filename, folder="history"):
         })
 
     result_df = pd.DataFrame(grouped_data)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = os.path.splitext(filename)[0]
-    filepath = os.path.join(folder, f"{base_name}_filtered_{timestamp}.xlsx")
 
-    with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+    # Tulis ke BytesIO
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         filtered_df.to_excel(writer, sheet_name='Data Terfilter', index=False)
         result_df.to_excel(writer, sheet_name='Ringkasan per Nama', index=False)
         df_processed.to_excel(writer, sheet_name='Data Original', index=False)
-
-    return filepath, f"Berhasil memproses {len(filtered_df)} record dari {len(df)} total record"
+    
+    buf.seek(0)
+    msg = f"Berhasil memproses {len(filtered_df)} record dari {len(df)} total record"
+    return buf, msg
 
 
 # =========================================================
 # 4️⃣  HELPER: buat Excel mutasi dengan baris TOTAL
 # =========================================================
 def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
-    """
-    Tambahkan baris TOTAL di bagian bawah kolom numerik,
-    lalu kembalikan sebagai BytesIO Excel.
-    """
     display_cols = [
         "Nama", "Bulan", "Tahun",
         "Saldo Awal (Opening Balance)",
@@ -305,7 +295,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     ]
     df_show = df_mutasi[display_cols].copy()
 
-    # Baris total
     total_debet  = df_mutasi["_total_debet_num"].sum()
     total_kredit = df_mutasi["_total_kredit_num"].sum()
     total_saldo_akhir = df_mutasi["_saldo_akhir_num"].sum()
@@ -325,8 +314,6 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_total.to_excel(writer, index=False, sheet_name='Rekap Mutasi')
-
-        # Auto-fit kolom (opsional, agar rapi)
         ws = writer.sheets['Rekap Mutasi']
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
@@ -380,46 +367,39 @@ if mode == "📊 Rekap SLIK":
             with st.expander("👁️ Preview Data", expanded=True):
                 st.dataframe(df_all, use_container_width=True)
 
-            # --- Simpan History dengan Filter ---
-            st.subheader("💾 Simpan ke History dengan Filter")
+            # --- Download Filtered Excel (tanpa simpan ke folder) ---
+            st.subheader("📥 Download Hasil Filtered SLIK")
             st.info("""
             **Filter:** Jenis Penggunaan = "Modal Kerja" **&** Kondisi = "Fasilitas"  
-            Disimpan dalam 3 sheet: Data Terfilter | Ringkasan per Nama | Data Original
+            File berisi 3 sheet: Data Terfilter | Ringkasan per Nama | Data Original
             """)
 
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                history_filename = st.text_input(
-                    "Nama file history:",
-                    value=f"SLIK_Filtered_{datetime.now().strftime('%Y%m%d')}",
+            # Generate filtered Excel in-memory
+            excel_buf, filter_msg = build_filtered_slik_excel(df_all, "SLIK_Filtered")
+            
+            if excel_buf:
+                st.success(f"✅ {filter_msg}")
+                
+                # Preview data terfilter
+                mask = (
+                    df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
+                    df_all['Kondisi'].str.contains('Fasilitas', case=False, na=False)
                 )
-            with col2:
-                st.write("")
-                save_btn = st.button("💾 Simpan History", type="primary")
+                with st.expander("👁️ Preview Data Terfilter"):
+                    st.dataframe(df_all[mask], use_container_width=True)
 
-            if save_btn and history_filename.strip():
-                fn = history_filename.strip()
-                if not fn.endswith('.xlsx'):
-                    fn += '.xlsx'
-                with st.spinner("Menyimpan..."):
-                    try:
-                        path, msg = process_history_with_filter(df_all, fn)
-                        if path:
-                            st.success(f"✅ {msg}")
-                            st.success(f"📁 Tersimpan di: `{path}`")
-                            # Preview filter result
-                            mask = (
-                                df_all['Jenis Penggunaan'].str.contains('Modal Kerja', case=False, na=False) &
-                                df_all['Kondisi'].str.contains('Fasilitas', case=False, na=False)
-                            )
-                            st.dataframe(df_all[mask].head(10), use_container_width=True)
-                        else:
-                            st.warning(f"⚠ {msg}")
-                    except Exception as e:
-                        st.error(f"❌ Error: {e}")
+                # Tombol download
+                st.download_button(
+                    "⬇️ Unduh SLIK Filtered (Excel)",
+                    data=excel_buf,
+                    file_name=f"SLIK_Filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            else:
+                st.warning(f"⚠ {filter_msg}")
 
-            # --- Download Excel lengkap ---
-            st.subheader("📥 Download Hasil Ekstraksi")
+            # --- Download Excel lengkap (tanpa filter) ---
+            st.subheader("📥 Download Hasil Ekstraksi Lengkap")
             buf = BytesIO()
             df_all.to_excel(buf, index=False)
             buf.seek(0)
@@ -476,10 +456,8 @@ else:
 
         if results:
             df_mutasi = pd.DataFrame(results)
-
             st.success(f"✅ Berhasil memproses {len(results)} file PDF!")
 
-            # ---- Preview tabel dengan baris TOTAL ----
             display_cols = [
                 "Nama", "Bulan", "Tahun",
                 "Saldo Awal (Opening Balance)",
@@ -510,26 +488,22 @@ else:
             )
 
             with st.expander("👁️ Preview Rekap Mutasi", expanded=True):
-                # Highlight baris TOTAL
                 def highlight_total(row):
                     if str(row["Nama"]).startswith("➕"):
                         return ['background-color: #fff3cd; font-weight: bold'] * len(row)
                     return [''] * len(row)
-
                 st.dataframe(
                     df_preview.style.apply(highlight_total, axis=1),
                     use_container_width=True,
                     hide_index=True,
                 )
 
-            # ---- Metrik ringkasan ----
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("File Diproses", len(results))
             c2.metric("Total Debet",   f"Rp {total_debet:,.0f}")
             c3.metric("Total Kredit",  f"Rp {total_kredit:,.0f}")
             c4.metric("Total Saldo Akhir", f"Rp {total_saldo_akhir:,.0f}")
 
-            # ---- Download Excel ----
             st.subheader("📥 Download Rekap Mutasi")
             excel_buf = build_mutasi_excel(df_mutasi)
             st.download_button(
