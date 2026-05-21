@@ -179,9 +179,11 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         tahun_str = '20' + parts[2]
 
     # --- Saldo & transaksi ---
-    def parse_rp(s):
+    def parse_rp_id(s):
+        """Parse format Indonesia '151.847,00' → float 151847.00"""
         try:
-            return float(s.replace(',', ''))
+            # Hapus titik (ribuan), ganti koma desimal jadi titik
+            return float(str(s).replace('.', '').replace(',', '.'))
         except Exception:
             return 0.0
 
@@ -194,29 +196,36 @@ def extract_mutasi_from_bytes(pdf_bytes, pdf_name):
         text
     )
     if sm:
-        saldo_awal   = parse_rp(sm.group(1))
-        total_debet  = parse_rp(sm.group(2))
-        total_kredit = parse_rp(sm.group(3))
-        saldo_akhir  = parse_rp(sm.group(4))
+        # PDF BRI biasanya pakai format US (151,847.00), jadi parse dengan format US dulu
+        def parse_rp_us(s):
+            try:
+                return float(str(s).replace(',', ''))
+            except Exception:
+                return 0.0
+        saldo_awal   = parse_rp_us(sm.group(1))
+        total_debet  = parse_rp_us(sm.group(2))
+        total_kredit = parse_rp_us(sm.group(3))
+        saldo_akhir  = parse_rp_us(sm.group(4))
 
-    def fmt_rp(v):
-        return f"{v:,.2f}"
+    def fmt_rp_id(v):
+        """Format float → string Rupiah format Indonesia: 151.847,00"""
+        # f"{v:,.2f}" → '151,847.00' (US), lalu swap separator
+        return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
 
     return {
         "Nama": nama,
         "Bulan": bulan_str,
         "Tahun": tahun_str,
-        "Saldo Awal (Opening Balance)": fmt_rp(saldo_awal),
-        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp(total_debet),
-        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp(total_kredit),
-        "Saldo Akhir (Closing Balance)": fmt_rp(saldo_akhir),
+        "Saldo Awal (Opening Balance)": fmt_rp_id(saldo_awal),
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(saldo_akhir),
         "_saldo_awal_num": saldo_awal,
         "_total_debet_num": total_debet,
         "_total_kredit_num": total_kredit,
         "_saldo_akhir_num": saldo_akhir,
         "Nama File PDF": pdf_name,
     }
-
 
 # =========================================================
 # 3️⃣  FUNGSI FILTER SLIK → KEMBALIKAN BYTESIO (BUKAN SAVE KE FOLDER)
@@ -299,14 +308,18 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     total_kredit = df_mutasi["_total_kredit_num"].sum()
     total_saldo_akhir = df_mutasi["_saldo_akhir_num"].sum()
 
+    def fmt_rp_id(v):
+        """Format float → Indonesian: 151.847,00"""
+        return f"{v:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
     total_row = {
         "Nama": "TOTAL",
         "Bulan": "",
         "Tahun": "",
         "Saldo Awal (Opening Balance)": "",
-        "Total Transaksi Debet (Total Debit Transaction)": f"{total_debet:,.2f}",
-        "Total Transaksi Kredit (Total Credit Transaction)": f"{total_kredit:,.2f}",
-        "Saldo Akhir (Closing Balance)": f"{total_saldo_akhir:,.2f}",
+        "Total Transaksi Debet (Total Debit Transaction)": fmt_rp_id(total_debet),
+        "Total Transaksi Kredit (Total Credit Transaction)": fmt_rp_id(total_kredit),
+        "Saldo Akhir (Closing Balance)": fmt_rp_id(total_saldo_akhir),
         "Nama File PDF": "",
     }
     df_total = pd.concat([df_show, pd.DataFrame([total_row])], ignore_index=True)
@@ -315,13 +328,27 @@ def build_mutasi_excel(df_mutasi: pd.DataFrame) -> BytesIO:
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_total.to_excel(writer, index=False, sheet_name='Rekap Mutasi')
         ws = writer.sheets['Rekap Mutasi']
+        
+        # Format kolom numerik agar Excel mengenali sebagai angka (opsional)
+        # Kolom E-H (index 4-7) adalah kolom numerik
+        for row in ws.iter_rows(min_row=2, min_col=5, max_col=8):
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    # Coba konversi ke float untuk disimpan sebagai angka di Excel
+                    try:
+                        num_val = float(cell.value.replace('.', '').replace(',', '.'))
+                        cell.value = num_val
+                        cell.number_format = '#,##0.00'  # Format Excel standar
+                    except ValueError:
+                        pass
+        
+        # Auto-fit kolom
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
 
     buf.seek(0)
     return buf
-
 
 # =========================================================
 # 5️⃣  STREAMLIT UI
