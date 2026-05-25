@@ -55,7 +55,7 @@ files_sumber_data = st.file_uploader(
 )
 
 if not file_nama_dicari or not files_sumber_data:
-    st.info("Silakan upload file 'Nama Dicari' dan minimal 1 file 'Sumber Data' untuk memulai proses.")
+    st.info("Upload Data Extract DWH dan AML hasil request ke tim kepatuhan")
     st.stop()
 
 # =====================
