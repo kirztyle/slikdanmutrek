@@ -2,10 +2,40 @@ import streamlit as st
 import pandas as pd
 from fuzzywuzzy import fuzz, process
 import io
+import re
 
 st.set_page_config(page_title="Fuzzy Matching Nama", layout="wide")
 
 st.title("🔍 Fuzzy Matching Nama – AML Screening")
+
+# =====================
+# 🔧 Helper Functions
+# =====================
+
+def clean_numeric_string(value):
+    """
+    Bersihkan nilai numeric string: hapus .0, handle NaN, pastikan string.
+    """
+    if pd.isna(value) or value == 'nan':
+        return ''
+    # Konversi ke string dulu
+    str_val = str(value).strip()
+    # Hapus trailing .0 jika ada (untuk integer yang terbaca sebagai float)
+    if str_val.endswith('.0') and str_val[:-2].replace('.', '').isdigit():
+        return str_val[:-2]
+    return str_val
+
+
+def format_columns_as_text(df, columns):
+    """
+    Format kolom tertentu sebagai text clean untuk export Excel.
+    """
+    df = df.copy()  # Hindari SettingWithCopyWarning
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_numeric_string)
+    return df
+
 
 # =====================
 # Upload File
@@ -31,7 +61,16 @@ if not file_nama_dicari or not files_sumber_data:
 # =====================
 # Baca File Nama Dicari
 # =====================
-df_nama = pd.read_excel(file_nama_dicari)
+# ✅ Baca dengan dtype=str untuk kolom identifier agar tidak jadi float
+df_nama = pd.read_excel(
+    file_nama_dicari,
+    dtype={
+        'CIF': str,
+        'NIK': str, 
+        'NPWP': str,
+        'STATUS': str
+    }
+)
 
 # =====================
 # ✅ MODIFIKASI: Compile multiple source files jadi satu DataFrame
@@ -41,7 +80,14 @@ df_sumber_list = []
 
 for file in files_sumber_data:
     try:
-        df_temp = pd.read_excel(file)
+        # ✅ Baca dengan dtype=str untuk kolom kunci
+        df_temp = pd.read_excel(
+            file,
+            dtype={
+                'Watchlist Name': str,
+                'Upload Type': str
+            }
+        )
         # Validasi kolom per file
         if "Watchlist Name" not in df_temp.columns or "Upload Type" not in df_temp.columns:
             st.warning(f"⚠️ File '{file.name}' tidak memiliki kolom required (Watchlist Name | Upload Type). Dilewati.")
@@ -87,9 +133,6 @@ threshold = st.slider(
     value=70
 )
 
-# ✅ Opsional: Filter hanya data dengan score >= threshold di akhir, 
-# atau tampilkan semua dengan highlight
-
 total_data = len(df_nama)
 progress = st.progress(0)
 log_box = st.empty()
@@ -120,7 +163,8 @@ for idx, row in df_nama.iterrows():
     if match_result:
         match, score = match_result[0], match_result[1]
         # Ambil UploadType - jika ada duplikat nama, ambil yang pertama
-        upload_type = df_sumber.loc[df_sumber["Watchlist Name"] == match, "Upload Type"].iloc[0] if not df_sumber[df_sumber["Watchlist Name"] == match].empty else "-"
+        mask = df_sumber["Watchlist Name"] == match
+        upload_type = df_sumber.loc[mask, "Upload Type"].iloc[0] if mask.any() else "-"
     else:
         match, score, upload_type = None, 0, "-"
 
@@ -156,16 +200,57 @@ st.subheader("📊 Hasil Fuzzy Matching")
 st.dataframe(df_hasil, use_container_width=True)
 
 # =====================
+# Input Nama Report (Opsional)
+# =====================
+st.subheader("⚙️ Pengaturan Export")
+
+report_suffix = st.text_input(
+    "📝 Masukkan keterangan untuk nama file (opsional)",
+    placeholder="Contoh: Q1-2026, Cabang-Jakarta, dll",
+    key="report_suffix_input"  # ✅ Tambahkan key untuk konsistensi state
+)
+
+# Generate filename dinamis - null safe
+base_filename = "Report AML Early Warning Monitoring"
+# ✅ Handle None/empty dengan aman
+suffix_clean = (report_suffix or "").strip()
+if suffix_clean:
+    # Sanitasi karakter yang tidak diizinkan di filename Windows
+    suffix_safe = re.sub(r'[<>:"/\\|?*]', '_', suffix_clean)
+    final_filename = f"{base_filename} - {suffix_safe}.xlsx"
+else:
+    final_filename = f"{base_filename}.xlsx"
+
+st.caption(f"📄 Nama file akan: `{final_filename}`")  # ✅ Preview filename untuk user
+
+# =====================
 # Download Excel
 # =====================
-# ✅ Perbaiki: to_excel() tidak return bytes, perlu buffer
-buffer = io.BytesIO
+# ✅ Pastikan NIK dan NPWP bertipe text clean
+df_export = df_hasil.copy()
+df_export = format_columns_as_text(df_export, ["NIK", "NPWP"])
+df_export = format_columns_as_text(df_export, ["CIF"])  # Juga bersihkan CIF jika diperlukan
+
+buffer = io.BytesIO()  # ✅ FIX: Tambahkan () untuk instantiate object
+
 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    df_hasil.to_excel(writer, index=False)
+    df_export.to_excel(writer, index=False)
+    
+    # ✅ Format sel sebagai Text di Excel (mencegah scientific notation)
+    worksheet = writer.sheets["Sheet1"]
+    for col in ["NIK", "NPWP", "CIF"]:
+        if col in df_export.columns:
+            col_idx = df_export.columns.get_loc(col) + 1  # openpyxl 1-based index
+            for row in range(2, len(df_export) + 2):  # skip header row
+                cell = worksheet.cell(row=row, column=col_idx)
+                cell.number_format = "@"  # Text format di Excel
+
+buffer.seek(0)
 
 st.download_button(
     label="⬇️ Download Hasil (Excel)",
     data=buffer.getvalue(),
-    file_name="hasil_fuzzy_matching_streamlit.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    file_name=final_filename,  # ✅ Menggunakan filename dinamis
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    key="download_excel_btn"  # ✅ Tambahkan key untuk konsistensi
 )
